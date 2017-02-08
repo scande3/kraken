@@ -7,13 +7,18 @@ import urlparse
 class EmailSpider(scrapy.Spider):
     name = 'email'
 
+    # Used by scrapy for the initial starting query points
     start_urls = []
 
-    # A list of already visited urls to skip for further processing
-    existing_visited = []
+    # The same as start_urls but without the 'http://' or 'https://'
+    httpless_start_urls = set([])
 
-    # List of found emails to dedup on
-    matched_emails = []
+
+    # A set of already visited urls to skip for further processing
+    existing_visited = set([])
+
+    # Set of found emails to dedup on
+    matched_emails = set([])
 
     verify_redirect_endpoint = True
 
@@ -27,9 +32,10 @@ class EmailSpider(scrapy.Spider):
     # The email regex. Taken from: https://gist.github.com/dideler/5219706
     # Removed "/" as part of the match because of too many false positives.
     # Sample of: /people/faculty/recohen@mit.edu for the removal
+    # Modified to force at least two characters in the domain. Case of <email>@c.e.r.n.
     regex = re.compile(("([a-z0-9!#$%&'*+=?^_`{|}~-]+(?:\.[a-z0-9!#$%&'*+=?^_`"
                         "{|}~-]+)*(@|\sat\s)(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(\.|"
-                        "\sdot\s))+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)"))
+                        "\sdot\s))+[a-z0-9][a-z0-9](?:[a-z0-9-]*[a-z0-9])?)"))
 
 
     def __init__(self, site='', verify_endpoint=True, *args, **kwargs):
@@ -48,7 +54,8 @@ class EmailSpider(scrapy.Spider):
         r = requests.get(site)
         if r.status_code == 200:
             self.start_urls.append(urlparse.urljoin(r.url, '/')[0:-1])
-            self.existing_visited.append(urlparse.urljoin(r.url, '/')[0:-1])
+            self.existing_visited.add(urlparse.urljoin(r.url, '/')[0:-1])
+            self.httpless_start_urls.add(re.sub(r'http[s]*\:\/\/', '', urlparse.urljoin(r.url, '/')[0:-1]))
         else:
             raise requests.RequestException('Site %s could not be resolved to a HTTP 200 status code' % site)
 
@@ -72,54 +79,88 @@ class EmailSpider(scrapy.Spider):
             A hash of {email: email_value} that is aggregated into an end output.
         """
 
-        if self.verify_redirect_endpoint and not response.url.startswith(tuple(self.start_urls)):
+        if self.verify_redirect_endpoint and not self.httpsless(response.url).startswith(tuple(self.httpless_start_urls)):
             return
 
         for email in self.get_emails(response.text):
             yield {'email': email}
+            #yield {'email': email, 'link': response.url}
         for link in response.css('a::attr(href)').extract():
             link = response.urljoin(link)
-
-            #yield {'link': link, 'start_url': self.start_urls[0]}
 
             # First check as the setting doesn't seem to work as expected in scrapy. Will keep trying to load links after
             # MAX_DEPTH even if it isn't actually allowing them to process further.
             if response.meta["depth"] < self.custom_settings['DEPTH_LIMIT'] and self.is_valid_link(link) is True:
 
-                # Add this url to the visited list. Exclude any trailing slash marks for consistency.
-                self.existing_visited.append(re.sub(r'\/$', '', link))
+                # Add this httpless url to the visited list. Exclude any trailing slash marks for consistency.
+                self.existing_visited.add(re.sub(r'\/$', '', self.httpsless(link)))
+
+                # Return this link to parse
                 yield scrapy.Request(link, callback=self.parse,)
 
 
     def is_valid_link(self, l):
+        # Get the httpless version of the url so that http and https are treated the same.
+        l = self.httpsless(l)
+
         guessed_type = mimetypes.guess_type(l.split('?')[0])
         # Ensure that we don't parse things like images or pdfs
         if guessed_type[0] is None or guessed_type[0].startswith('text'):
             # Ensure that we stick only to this domain.
-            # FIXME: There is an issue with http vs https in this sample application. Also with www vs non-www.
-            if l.startswith(tuple(self.start_urls)):
+            if l.startswith(tuple(self.httpless_start_urls)):
                 # Exclude sites we have already visited
                 if l not in self.existing_visited:
                     return True
 
         return False
 
+    def httpsless(self, l):
+        """Returns a httpless version of the url. """
+        return re.sub(r'http[s]*\:\/\/', '', l)
 
     def get_emails(self, s):
-        """Returns an iterator of matched emails found in string s."""
-        # Removing lines that start with '//' because the regular expression
-        # mistakenly matches patterns like 'http://foo@bar.com' as '//foo@bar.com'.
-        # Additionally, remove things that match a mimetype since that is generally an image link that looks like an email.
-        # Do some cleaning of the returned email. In this example case, only swap " at " for "@".
-        # Final check to not at some numbers that were matching the pattern.
-        return_emails = []
-        for email in re.findall(self.regex, s):
-            if email[0] not in self.matched_emails:
-                if not email[0].startswith('//'):
-                    if  mimetypes.guess_type(email[0])[0] is None or (not mimetypes.guess_type(email[0])[0].startswith('image') and not mimetypes.guess_type(email[0])[0].startswith('video')):
-                        cleaned_email = re.sub(r'\sat\s', '@', email[0])
-                        if not re.match(r'.+@[\d\.]+$', cleaned_email):
-                            self.matched_emails.append(cleaned_email)
-                            return_emails.append(cleaned_email)
+        """Returns an iterator of matched emails found in string s. """
 
-        return return_emails
+        for email in re.findall(self.regex, s):
+            cleaned_email = self.clean_email(email[0])
+            if cleaned_email not in self.matched_emails:
+                if self.is_email(cleaned_email):
+                    self.matched_emails.add(cleaned_email)
+                    yield cleaned_email
+
+
+    def is_email(self, email):
+        """Holds tests to determine whether a matched email really is an email.
+
+        Returns False or True.
+        """
+
+        # Determine that this wasn't some weirdly named file that matched the regex. Ex: pic@me.jpg
+        if mimetypes.guess_type(email)[0] is not None and mimetypes.guess_type(email)[0].startswith(('image', 'video')):
+            return False
+
+        # Determine that it isn't a phone number. Ex: me@999.999.9999
+        if re.match(r'.+@[\d\.]+$', email):
+            return False
+
+        return True
+
+
+    def clean_email(self, email):
+        """Holds functions to clean the email to a single format. For now, this just takes " at " and replaces it with
+        "@". and " dot " with ".". Additionally, some emails had a url encoded space before them that I am removing.
+        In the future, more logic to standardize the email response should be added here as additional email detection
+        cases are discovered.
+
+        Returns a String that is the cleaned email with replacements done.
+        """
+
+        replacements = {
+            r'\sat\s': "@",
+            r'\sdot\s': ".",
+            r'^%20': ''
+        }
+        for find_match, replace_match in replacements.items():
+            email = re.sub(find_match, replace_match, email)
+
+        return email
